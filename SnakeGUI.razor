@@ -1,0 +1,461 @@
+﻿@page "/snake"
+@rendermode InteractiveServer
+@using Blazor.Extensions
+@using Blazor.Extensions.Canvas
+@using Blazor.Extensions.Canvas.Canvas2D
+@using System.Numerics
+@using System.Diagnostics
+@using System.Text.Json
+@using GUI.Client.Controllers
+@using GUI.Client.Models
+@using MySql.Data.MySqlClient
+@{
+// <summary>
+//  View portion of the Eel Extravaganza game. Handles drawing the
+//  items (walls, eels, fish powerups) from the server, allows a player
+//  to connect/disconnect, and includes a driver method for handling
+//  player inputs (w,a,s,d).
+// </summary>
+// <author>
+//  Benjamin Keefer and Madi Murray
+// </author>
+// <version>
+//  December 5th, 2024
+// </version>
+}
+
+@inject IJSRuntime JsRuntime;
+
+<PageTitle> Snake </PageTitle>
+
+<p>
+    <label value="test"><b>Player name: </b></label>
+    <input @bind="playerName" />
+    <label value="localhost"><b>Server address: </b></label>
+    <input @bind="address" />
+    <label value="11000"><b>Port: </b></label>
+    <input @bind="port" type="number" />
+    <button class="primary-button" @onclick="Submit">@connectButton</button>
+</p>
+
+@if(showError)
+{
+    <div class="error-popup">
+        <div class="error-content">
+            <span class="close" @onclick="() => {showError = false;}">
+                &times;
+            </span>
+            <p>@ErrorMessage </p>
+        </div>
+    </div>
+}
+<img @ref="backgroundImage" id="bgImage" src="images/OceanBackground-02.png" alt="image" style="display:none;" />
+<img @ref="wallImage" id="bgImage" src="images/Rock-02.png" alt="image" style="display:none;" />
+<img @ref="coralImage" id="bgImage" src="images/Coral.png" alt="image" style="display:none;" />
+
+<img @ref="fishImage1" id="bgImage" src="images/Fish1-02.png" alt="image" style="display:none;" />
+<img @ref="fishImage2" id="bgImage" src="images/Fish2-02.png" alt="image" style="display:none;" />
+<img @ref="fishImage3" id="bgImage" src="images/Fish3-02.png" alt="image" style="display:none;" />
+
+<div id="snakeCanvas" style="position: fixed; width: 100%; height: 100%">
+    <BECanvas Width="1000" Height="1000" @ref="canvasReference"></BECanvas>
+</div>
+
+@code
+{
+    /// <summary> Used to create the canvas </summary>
+    private BECanvasComponent canvasReference = null!;
+    /// <summary> The canvas for the page </summary>
+    private Canvas2DContext context = null!;
+    /// <summary> Used to make the game's javascript work </summary>
+    private IJSObjectReference jsModule = null!;
+    /// <summary> Controller collects from and sends data to the server </summary>
+    private NetworkController? controller;
+
+    /// <summary> Stores player's inputted name, default is Eel </summary>
+    private string playerName = "Eel";
+    /// <summary> Stores player's inputted server address, default is localhost </summary>
+    private string address = "localhost";
+    /// <summary> Stores player's inputted port number, default is 11000 </summary>
+    private int port = 11000;
+    /// <summary> Boolean that toggles the visibility of the error popup </summary>
+    private bool showError = false;
+
+    /// <summary> The ID in the SQL database of the current game being played. </summary>
+    private string currentGameID = string.Empty;
+
+    /// <summary> Message on the connect button, changes to disconnect when connected </summary>
+    private string connectButton = "Connect";
+    /// <summary> Error message displayed in the error popup </summary>
+    private string ErrorMessage = "Invalid Input :(";
+    /// <summary>  Width and height of the display canvas </summary>
+    private int ViewSize = 1000;
+
+    /// <summary> Reference to the ocean background image </summary>
+    private ElementReference backgroundImage;
+    /// <summary> Reference to the rock wall image </summary>
+    private ElementReference wallImage;
+    /// <summary> Reference to the coral barrier image </summary>
+    private ElementReference coralImage;
+
+    /// <summary> Reference to the first fish image </summary>
+    private ElementReference fishImage1;
+    /// <summary> Reference to the second fish image </summary>
+    private ElementReference fishImage2;
+    /// <summary> Reference to the third fish image </summary>
+    private ElementReference fishImage3;
+
+    /// <summary>
+    ///  Initializes the canvas the first time the page is loaded.
+    /// </summary>
+    /// <param name="firstRender"></param>
+    /// <returns> Task </returns>
+    protected override async Task OnAfterRenderAsync( bool firstRender )
+    {
+        if ( firstRender )
+        {
+            // Declares the javascript module and the canvas before initializing the JS rendering
+            jsModule = await JsRuntime.InvokeAsync<IJSObjectReference>( "import", "./Pages/SnakeGUI.razor.js" );
+            context = await canvasReference.CreateCanvas2DAsync();
+            await JsRuntime.InvokeAsync<object>( "initRenderJS", DotNetObjectReference.Create( this ) );
+        }
+    }
+
+    /// <summary>
+    ///  Continuously draws the next frame every 20 milliseconds
+    /// </summary>
+    private async void GameLoop()
+    {
+        while (true)
+        {
+            // Waits 20 milliseconds before drawing the frame
+            Thread.Sleep(20);
+            if(controller!.world!.getThisSnakeHead() != null)
+            {
+                await DrawFrame();
+            }
+        }
+    }
+
+    /// <summary>
+    ///  Draws each object from the world to the canvas.
+    /// </summary>
+    /// <returns> Task </returns>
+    private async Task DrawFrame()
+    {
+        // Sets color to white which affects the color of player names, scores, and disconnect screen
+        await context.SetFillStyleAsync("white");
+
+        // Draws white over the canvas when the user disconnects
+        if(connectButton == "Connect")
+        {
+            await context.FillRectAsync(0, 0, controller!.world!.worldSize, controller!.world!.worldSize);
+            return;
+        }
+
+        // Drawing copy used for locking to prevent race condition with the world
+        World drawingCopy;
+        lock (controller!.world!)
+        {
+            drawingCopy = new(controller.world);
+        }
+
+        ViewSize = drawingCopy.worldSize / 2;
+
+        // batch the drawing calls for better performance
+        await context.BeginBatchAsync();
+        // clip the view so that objects drawn outside the canvas will not be shown
+        await context.BeginPathAsync();
+        await context.RectAsync(0, 0, ViewSize, ViewSize);
+        await context.ClipAsync();
+
+        // Because we are modifying the transformation matrix
+        // this saves it so we can restore it at the end
+        await context.SaveAsync();
+
+        // Centers canvas on the middle of the view port
+        await context.TranslateAsync(ViewSize / 2, ViewSize / 2);
+
+        // Stores coordinates of the snake's head for translating the screen
+        int x = drawingCopy.getThisSnakeHead()!.X;
+        int y = drawingCopy.getThisSnakeHead()!.Y;
+        // Makes it so the screen never displays beyond the map's border
+        if (x < -(ViewSize / 2))
+        {
+            x = -(ViewSize / 2);
+        }
+        else if (x > ViewSize / 2)
+        {
+            x = ViewSize / 2;
+        }
+        if (y < -(ViewSize / 2))
+        {
+            y = -(ViewSize / 2);
+        }
+        else if (y > (ViewSize / 2))
+        {
+            y = ViewSize / 2;
+        }
+        // Centers screen around the snake's head
+        await context.TranslateAsync(-x, -y);
+
+        // Draws the background
+        int size = drawingCopy.worldSize;
+        await context.DrawImageAsync(backgroundImage, -ViewSize, -ViewSize, ViewSize * 2, ViewSize * 2);
+
+        // Draws each wall in the map
+        foreach (Wall w in drawingCopy.Walls)
+        {
+            // Horizontal wall case
+            if(w.p1.Y == w.p2.Y)
+            {
+                int leftXCoord;
+                int rightXCoord;
+                // Determines which coordinate represents the left and right sides of the wall
+                if (w.p1.X > w.p2.X)
+                {
+                    leftXCoord = w.p2.X;
+                    rightXCoord = w.p1.X;
+                }
+                else
+                {
+                    leftXCoord = w.p1.X;
+                    rightXCoord = w.p2.X;
+                }
+                // Draws walls as rocks if they are the walls around the border of the map
+                if(rightXCoord-leftXCoord > ViewSize - 50){
+                    for (int i = leftXCoord; i <= rightXCoord; i += 50)
+                    {
+                        await context.DrawImageAsync(wallImage, i - 25, w.p1.Y - 25, 50, 50);
+                    }
+                }
+                // Draws walls as blocks of coral otherwise
+                else{
+                    for (int i = leftXCoord; i <= rightXCoord; i += 50)
+                    {
+                        await context.DrawImageAsync(coralImage, i - 25, w.p1.Y - 25, 50, 50);
+                    }
+                }
+            }
+            // Vertical wall case
+            else
+            {
+                int topYCoord;
+                int bottomYCoord;
+                // Determines which coordinate represents the top and bottom sides of the wall
+                if (w.p1.Y > w.p2.Y)
+                {
+                    topYCoord = w.p2.Y;
+                    bottomYCoord = w.p1.Y;
+                }
+                else
+                {
+                    topYCoord = w.p1.Y;
+                    bottomYCoord = w.p2.Y;
+                }
+                // Same rock/coral logic as above
+                if (bottomYCoord - topYCoord > ViewSize - 50)
+                {
+                    for (int i = topYCoord; i <= bottomYCoord; i += 50)
+                    {
+                        await context.DrawImageAsync(wallImage, w.p1.X - 25, i - 25, 50, 50);
+                    }
+                }
+                else
+                {
+                    for (int i = topYCoord; i <= bottomYCoord; i += 50)
+                    {
+                        await context.DrawImageAsync(coralImage, w.p1.X - 25, i - 25, 50, 50);
+                    }
+                }
+            }
+        }
+        // Draws all of the powerups in the map
+        foreach(KeyValuePair<int,Powerup> p in drawingCopy.powerups)
+        {
+            // Only draws the powerup if it hasn't been eaten
+            if (p.Value.died == false)
+            {
+                // Draws the powerup as one of three fish depending on its powerup ID
+                int idx = p.Value.power % 3;
+                switch (idx)
+                {
+                    case 0: await context.DrawImageAsync(fishImage1, p.Value.loc.X - 10, p.Value.loc.Y - 10, 20, 20); break;
+                    case 1: await context.DrawImageAsync(fishImage2, p.Value.loc.X - 10, p.Value.loc.Y - 10, 20, 20); break;
+                    case 2: await context.DrawImageAsync(fishImage3, p.Value.loc.X - 10, p.Value.loc.Y - 10, 20, 20); break;
+                }
+
+            }
+        }
+
+        // Draws all of the snakes in the world
+        foreach(KeyValuePair<int, Snake> kvp in drawingCopy.snakes)
+        {
+            await context.BeginPathAsync();
+
+            // Gets the snake's vertices
+            List<Point2D> snake = kvp.Value.body;
+            int length = snake.Count;
+
+            // Displays snake's name and score
+            await context.FillTextAsync(kvp.Value.name + ": " + kvp.Value.score, snake[length - 1].X + 10, kvp.Value.body[length - 1].Y - 10, 100);
+            await context.SetLineWidthAsync(10);
+
+            // Sets the color of the snake to pink if it's not alive
+            if(kvp.Value.alive == false)
+            {
+                await context.SetStrokeStyleAsync($"rgb( 255, 125, 125 )");
+            }
+            // Otherwise changes the snake to a bright color depending on its snake ID
+            else
+            {
+                int idx = kvp.Value.snake % 10;
+                switch(idx)
+                {
+                    case 0: await context.SetStrokeStyleAsync($"rgb( 97, 255, 139 )"); break;
+                    case 1: await context.SetStrokeStyleAsync($"rgb( 255, 117, 253 )"); break;
+                    case 2: await context.SetStrokeStyleAsync($"rgb( 168, 241, 255 )"); break;
+                    case 3: await context.SetStrokeStyleAsync($"rgb( 252, 248, 3 )"); break;
+                    case 4: await context.SetStrokeStyleAsync($"rgb( 182, 252, 3 )"); break;
+                    case 5: await context.SetStrokeStyleAsync($"rgb( 247, 80, 2 )"); break;
+                    case 6: await context.SetStrokeStyleAsync($"rgb( 247, 2, 120 )"); break;
+                    case 7: await context.SetStrokeStyleAsync($"rgb( 247, 2, 10 )"); break;
+                    case 8: await context.SetStrokeStyleAsync($"rgb( 80, 247, 2 )"); break;
+                    case 9: await context.SetStrokeStyleAsync($"rgb( 3, 207, 252 )"); break;
+
+                }
+            }
+            // Places "drawing pen" on the snake's head
+            await context.MoveToAsync(snake[length - 1].X, kvp.Value.body[length - 1].Y);
+            // Draws the pen between each vertex in the snake
+            for(int i = length - 1; i >= 0; i--)
+            {
+                await context.LineToAsync(kvp.Value.body[i].X, kvp.Value.body[i].Y);
+            }
+            await context.StrokeAsync();
+        }
+
+        // Wraps up the batching
+        await context.RestoreAsync();
+        await context.EndBatchAsync();
+
+        // Redraws screen
+        StateHasChanged();
+    }
+
+    /// <summary>
+    ///  Driver for snake movement based on user input
+    /// </summary>
+    /// <param name="key"></param>
+    [JSInvokable]
+    public void HandleKeyPress( string key )
+    {
+        if (controller == null)
+        {
+            return;
+        }
+        controller.Move(key.ToLower());
+    }
+
+    /// <summary>
+    ///  Method for connecting and disconnecting from the server.
+    /// </summary>
+    public void Submit()
+    {
+        // Disconnects the client from the server
+        if(connectButton == "Disconnect")
+        {
+            //set this game's end time in the database once disconnected
+            string command = "UPDATE Games SET endTime = \"" + DateTime.Now.ToString("yyyy-MM-dd H:mm:ss") + "\" WHERE gID = \"" + currentGameID + "\";";
+            controller!.connection.DBUpdateCommand(command);
+
+            //update the leave time for each snake in this game in the database
+            foreach(Snake snake in controller!.world!.snakes.Values)
+            {
+               command= "UPDATE Players SET leaveTime = \"" + DateTime.Now.ToString("yyyy-MM-dd H:mm:ss")  +
+                                "\" WHERE pID = \"" + snake.snake + "\" AND gID = \"" + currentGameID +"\";";
+                controller!.connection.DBUpdateCommand(command);
+            }
+            controller!.connection.Disconnect();
+            connectButton = "Connect";
+            return;
+        }
+
+        // Displays error if the user does not enter valid inputs before connecting
+        if(playerName == null || playerName == string.Empty || playerName.Length > 16 || address == null || address == string.Empty || port != 11000)
+        {
+            showError = true;
+            ErrorMessage = "Invalid Input:(";
+            return;
+        }
+
+        // Attempts to connect to the server
+        try
+        {
+            controller = new NetworkController(playerName, address, port);
+        }
+        // Displays an error if connecting fails
+        catch(Exception)
+        {
+            showError = true;
+            ErrorMessage = "Could not connect to the server :(";
+            connectButton = "Connect";
+            return;
+        }
+
+        //add the start time into the database when connect is pressed
+        currentGameID = controller.connection.DBUpdateCommand("INSERT INTO Games (startTime) values(\"" + DateTime.Now.ToString("yyyy-MM-dd H:mm:ss ") + "\");");
+        controller.currentGameID = currentGameID;
+
+        // Starts the network connection on a new thread
+        new Thread( () => controller.StartConnection() ).Start();
+
+        connectButton = "Disconnect";
+        // Starts drawing frames in a loop
+        GameLoop();
+    }
+}
+
+<style>
+    .primary-button{
+        background-color: deeppink;
+        color: white;
+        font-weight: bold !important; /* Bold text */
+        border: thick;
+        width: 100px;
+        height: 40px;
+    }
+    .close {
+        color: #aaa;
+        float: right;
+        font-size: 28px;
+        font-weight: bold;
+        cursor: pointer;
+    }
+
+    .close:hover,
+    .close:focus {
+        color: black;
+        text-decoration: none;
+    }
+
+    .error-popup {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: rgba(0, 0, 0, 0.5);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+    }
+    .error-content {
+        background-color: white;
+        padding: 20px;
+        border-radius: 5px;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        text-align: center;
+    }
+</style>
